@@ -1,0 +1,25 @@
+# Local build/cache and IDE state
+.gradle/
+.kotlin/
+.idea/
+*.iml
+**/build/
+local.properties
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Signing keys, credentials, personal exports
+*.jks
+*.keystore
+keystore.properties
+key.properties
+.env
+.env.*
+!.env.example
+credentials*.json
+backups/
+*.apk
+*.aab
+*.log
