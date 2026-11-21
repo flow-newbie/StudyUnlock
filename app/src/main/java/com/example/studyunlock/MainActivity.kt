@@ -77,7 +77,8 @@ class MainActivity : ComponentActivity() {
         val refresh = {
             usage = hasUsageAccess(this)
             accessibility = monitorEnabled(this)
-            if (!usage || !accessibility) store.incomplete("监测权限未开启")
+            if (!usage) store.incomplete("使用情况访问未授权")
+            if (!accessibility) store.incomplete("无障碍服务未开启")
             if (!StudyMonitor.connected.value) {
                 store.markMonitoringGap(getSharedPreferences("monitor", MODE_PRIVATE).getLong("last", 0L))
             }
@@ -154,9 +155,10 @@ class MainActivity : ComponentActivity() {
                             val seconds = day?.getInt("seconds") ?: 0
                             val completion = day?.getInt("completion") ?: 0
                             val unlocked = day?.optString("status") == "unlocked"
+                            val ended = day?.optBoolean("endedEarly") == true
                             Glass {
                                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                    Section(if (unlocked) "娱乐已解锁" else "学习时长")
+                                    Section(if (ended) "已结束学习" else if (unlocked) "娱乐已解锁" else "学习时长")
                                     if (day?.optBoolean("practice") == true) Text("试用日", color = Muted)
                                 }
                                 Text(formatTime(seconds), style = MaterialTheme.typography.displaySmall, fontWeight = FontWeight.SemiBold)
@@ -164,13 +166,31 @@ class MainActivity : ComponentActivity() {
                                     modifier = Modifier.fillMaxWidth().height(6.dp).padding(end = 1.dp))
                                 Entry("目标", "$target 分钟")
                                 Entry("完成度", "$completion%")
-                                if (!unlocked) Entry("紧急放行", "剩 ${2 - (day?.optInt("passes") ?: 0)} 次")
-                                if (!unlocked && day != null) Button(onClick = { dialog = "completion" }) { Text("更新完成度") }
+                                if (day?.isLearning() == true) {
+                                    val limits = day.passLimits()
+                                    Entry("今日紧急放行", "剩 ${limits.daily - day.optInt("passes")} 次")
+                                    if (store.remainingPass(day) > 0) Entry("本次可再打开", "${limits.opens - day.optInt("opensUsed")} 次")
+                                    Button(onClick = { dialog = "completion" }) { Text("更新完成度") }
+                                    if (getSystemService(android.app.KeyguardManager::class.java).isDeviceSecure) {
+                                        TextButton(onClick = { startActivity(StudyExitActivity.intent(this@MainActivity, end = true)) }) {
+                                            Text("结束今日学习")
+                                        }
+                                    }
+                                }
                                 if (unlocked) Text("今日 24:00 截止", color = Muted)
                                 if (day?.optBoolean("incomplete") == true && !unlocked) Text("今日记录不完整", color = Muted)
                             }
                         }
-                        if (template != null && !ready) OutlinedButton(onClick = { page = 2 }) { Text("恢复监测权限") }
+                        if (template != null) {
+                            if (ready) Text("监测正常", color = Muted)
+                            else OutlinedButton(onClick = { page = 2 }) {
+                                Text(when {
+                                    !usage -> "开启使用情况访问"
+                                    !accessibility -> "开启无障碍服务"
+                                    else -> "无障碍服务尚未连接"
+                                })
+                            }
+                        }
                         Glass { Entry("积分余额", balance.toString()) }
                     }
                     1 -> {
@@ -220,6 +240,7 @@ class MainActivity : ComponentActivity() {
                             PermissionRow("使用情况访问", usage, Settings.ACTION_USAGE_ACCESS_SETTINGS)
                             PermissionRow("无障碍服务", accessibility, Settings.ACTION_ACCESSIBILITY_SETTINGS)
                             if (accessibility && !connected) Text("等待系统连接服务", color = Muted)
+                            if (ready) Text("监测正常", color = Muted)
                         }
                         Glass {
                             Section("学习规则")
@@ -283,8 +304,8 @@ class MainActivity : ComponentActivity() {
         }
 
         when {
-            dialog == "rules" -> RulesDialog(template, { dialog = "" }) { minutes, reward, penalty, initial, study, entertainment ->
-                store.saveSettings(minutes, reward, penalty, initial, study, entertainment)
+            dialog == "rules" -> RulesDialog(template, { dialog = "" }) { minutes, reward, penalty, initial, study, entertainment, limits ->
+                store.saveSettings(minutes, reward, penalty, initial, study, entertainment, limits)
                 if (template == null) store.openDay()
                 dialog = ""
                 page = 0
@@ -342,16 +363,21 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun RulesDialog(template: JSONObject?, close: () -> Unit,
-        save: (Int, Int, Int, Int, Set<String>, Set<String>) -> Unit) {
+        save: (Int, Int, Int, Int, Set<String>, Set<String>, PassLimits) -> Unit) {
         var minutes by rememberSaveable { mutableStateOf(template?.getInt("minutes")?.toString() ?: "30") }
         var reward by rememberSaveable { mutableStateOf(template?.getInt("reward")?.toString() ?: "10") }
         var penalty by rememberSaveable { mutableStateOf(template?.getInt("penalty")?.toString() ?: "5") }
         var initial by rememberSaveable { mutableStateOf(if (template == null) "" else "0") }
+        val defaultLimits = template?.passLimits() ?: PassLimits()
+        var passMinutes by rememberSaveable { mutableStateOf(defaultLimits.minutes.toString()) }
+        var passDaily by rememberSaveable { mutableStateOf(defaultLimits.daily.toString()) }
+        var passOpens by rememberSaveable { mutableStateOf(defaultLimits.opens.toString()) }
         var study by rememberSaveable { mutableStateOf(ArrayList(template?.packages("study").orEmpty())) }
         var entertainment by rememberSaveable { mutableStateOf(ArrayList(template?.packages("entertainment").orEmpty())) }
         var picker by rememberSaveable { mutableStateOf("") }
         val valid = minutes.toIntOrNull() in 1..1440 && listOf(reward, penalty, initial).all { it.toIntOrNull() in 0..1000 } &&
-            study.isNotEmpty() && entertainment.isNotEmpty() && study.intersect(entertainment.toSet()).isEmpty()
+            study.isNotEmpty() && entertainment.isNotEmpty() && study.intersect(entertainment.toSet()).isEmpty() &&
+            passMinutes.toIntOrNull() in 1..60 && passDaily.toIntOrNull() in 0..20 && passOpens.toIntOrNull() in 1..20
         if (picker.isNotEmpty()) {
             val pickingStudy = picker == "学习应用"
             AppPicker(picker, if (pickingStudy) study else entertainment, if (pickingStudy) entertainment else study,
@@ -373,10 +399,15 @@ class MainActivity : ComponentActivity() {
                     OutlinedButton(onClick = { picker = "娱乐应用" }, Modifier.fillMaxWidth()) {
                         Text("娱乐应用 · ${entertainment.size}")
                     }
+                    Section("紧急放行")
+                    Numeric("每次放行分钟数（1–60）", passMinutes) { passMinutes = it }
+                    Numeric("每日放行次数（0–20）", passDaily) { passDaily = it }
+                    Numeric("每次最多打开娱乐 App（1–20 次）", passOpens) { passOpens = it }
                 }
             },
             confirmButton = { TextButton(enabled = valid, onClick = {
-                save(minutes.toInt(), reward.toInt(), penalty.toInt(), initial.toInt(), study.toSet(), entertainment.toSet())
+                save(minutes.toInt(), reward.toInt(), penalty.toInt(), initial.toInt(), study.toSet(), entertainment.toSet(),
+                    PassLimits(passMinutes.toInt(), passDaily.toInt(), passOpens.toInt()))
             }) { Text("保存") } },
             dismissButton = { TextButton(onClick = close) { Text("取消") } })
     }

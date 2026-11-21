@@ -48,7 +48,7 @@ internal class StudyStore private constructor(context: Context) {
         changes.value++
     }
 
-    fun saveSettings(minutes: Int, reward: Int, penalty: Int, initial: Int, study: Set<String>, entertainment: Set<String>) {
+    fun saveSettings(minutes: Int, reward: Int, penalty: Int, initial: Int, study: Set<String>, entertainment: Set<String>, limits: PassLimits) {
         require(minutes in 1..1440 && reward in 0..1000 && penalty in 0..1000 && initial in 0..1000)
         require(study.isNotEmpty() && entertainment.isNotEmpty() && study.intersect(entertainment).isEmpty())
         if (settings() == null) {
@@ -60,6 +60,7 @@ internal class StudyStore private constructor(context: Context) {
         val template = JSONObject().put("minutes", minutes).put("reward", reward).put("penalty", penalty)
             .put("study", JSONArray(study.toList().sorted())).put("entertainment", JSONArray(entertainment.toList().sorted()))
             .put("effective", effective.toString())
+            .put("passMinutes", limits.minutes).put("dailyPasses", limits.daily).put("passOpens", limits.opens)
         if (versions.length() > 0 && versions.getJSONObject(versions.length() - 1).getString("effective") == effective.toString()) {
             versions.put(versions.length() - 1, template)
         } else versions.put(template)
@@ -128,7 +129,7 @@ internal class StudyStore private constructor(context: Context) {
 
     fun changeCompletion(value: Int, ready: Boolean) {
         val day = today() ?: return
-        if (day.getString("status") != "active") return
+        if (!day.isLearning()) return
         day.put("completion", value.coerceIn(0, 100)).put("completionAt", System.currentTimeMillis())
         unlock(day, date(), ready)
         commit()
@@ -157,7 +158,7 @@ internal class StudyStore private constructor(context: Context) {
     }
 
     private fun unlock(day: JSONObject, key: LocalDate, ready: Boolean) {
-        if (!ready || day.getString("status") != "active" || day.getInt("seconds") < day.getInt("minutes") * 60 ||
+        if (!ready || !day.isLearning() || day.getInt("seconds") < day.getInt("minutes") * 60 ||
             day.getInt("completion") != 100) return
         day.put("status", "unlocked").put("unlockedAt", System.currentTimeMillis())
         if (!day.optBoolean("practice")) {
@@ -169,26 +170,45 @@ internal class StudyStore private constructor(context: Context) {
 
     fun recheck() {
         val day = today() ?: return
-        if (day.getString("status") == "active" && day.getInt("completion") == 100 &&
+        if (day.isLearning() && day.getInt("completion") == 100 &&
             day.getInt("seconds") >= day.getInt("minutes") * 60) {
             unlock(day, date(), true)
             commit()
         }
     }
 
+    fun canPass(day: JSONObject): Boolean = day.isLearning() && remainingPass(day) == 0L &&
+        day.optInt("passes") < day.passLimits().daily
+
     fun pass(day: JSONObject) {
-        if (day.getInt("passes") >= 2 || day.getString("status") != "active") return
+        if (today() !== day || !canPass(day)) return
+        val limits = day.passLimits()
         day.put("passes", day.getInt("passes") + 1)
-            .put("pauseUntil", SystemClock.elapsedRealtime() + 300_000)
+            .put("pauseUntil", SystemClock.elapsedRealtime() + limits.minutes * 60_000L)
             .put("pauseBoot", System.currentTimeMillis() - SystemClock.elapsedRealtime())
-        appendEvent("紧急放行")
+            .put("opensUsed", 0)
+        appendEvent("紧急放行：${limits.minutes} 分钟，最多 ${limits.opens} 次打开")
+        commit()
+    }
+
+    fun usePassOpening(day: JSONObject): Boolean {
+        if (today() !== day || remainingPass(day) == 0L || day.optInt("opensUsed") >= day.passLimits().opens) return false
+        day.put("opensUsed", day.optInt("opensUsed") + 1)
+        commit()
+        return true
+    }
+
+    fun endLearning(day: JSONObject) {
+        if (today() !== day || !day.isLearning()) return
+        day.put("endedEarly", true).put("pauseUntil", 0).put("pauseBoot", 0)
+        appendEvent("主动结束学习")
         commit()
     }
 
     fun remainingPass(day: JSONObject): Long {
         val boot = System.currentTimeMillis() - SystemClock.elapsedRealtime()
         if (kotlin.math.abs(boot - day.optLong("pauseBoot")) > 5_000) return 0
-        return (day.optLong("pauseUntil") - SystemClock.elapsedRealtime()).coerceIn(0, 300_000)
+        return (day.optLong("pauseUntil") - SystemClock.elapsedRealtime()).coerceIn(0, day.passLimits().minutes * 60_000L)
     }
 
     fun adjust(delta: Int, note: String) {
@@ -221,6 +241,7 @@ internal class StudyStore private constructor(context: Context) {
         fun checkTemplate(item: JSONObject) {
             require(item.getInt("minutes") in 1..1440 && item.getInt("reward") in 0..1000 &&
                 item.getInt("penalty") in 0..1000)
+            item.passLimits()
             LocalDate.parse(item.getString("effective"))
             val study = item.packages("study")
             val entertainment = item.packages("entertainment")
@@ -240,7 +261,8 @@ internal class StudyStore private constructor(context: Context) {
             LocalDate.parse(key)
             val day = incomingDays.getJSONObject(key)
             checkTemplate(day)
-            require(day.getInt("seconds") >= 0 && day.getInt("completion") in 0..100 && day.getInt("passes") in 0..2)
+            require(day.getInt("seconds") >= 0 && day.getInt("completion") in 0..100 &&
+                day.getInt("passes") in 0..day.passLimits().daily && day.optInt("opensUsed") in 0..day.passLimits().opens)
             require(day.getString("status") in setOf("active", "unlocked", "failed", "incomplete", "practice"))
             for (field in listOf("usage", "studyUsage")) {
                 day.optJSONObject(field)?.let { usage ->
@@ -270,6 +292,13 @@ internal class StudyStore private constructor(context: Context) {
         fun get(context: Context): StudyStore = instance ?: StudyStore(context.applicationContext).also { instance = it }
     }
 }
+
+internal data class PassLimits(val minutes: Int = 5, val daily: Int = 2, val opens: Int = 2) {
+    init { require(minutes in 1..60 && daily in 0..20 && opens in 1..20) }
+}
+
+internal fun JSONObject.passLimits() = PassLimits(optInt("passMinutes", 5), optInt("dailyPasses", 2), optInt("passOpens", 2))
+internal fun JSONObject.isLearning() = optString("status") == "active" && !optBoolean("endedEarly")
 
 internal fun JSONObject.packages(key: String): Set<String> {
     val array = getJSONArray(key)

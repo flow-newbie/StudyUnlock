@@ -64,6 +64,8 @@ class StudyMonitor : AccessibilityService() {
     private var verificationFailed = false
     private var verificationDay: LocalDate? = null
     private var splitActive = false
+    private var allowedApp: String? = null
+    private var allowance = 0L
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -122,7 +124,7 @@ class StudyMonitor : AccessibilityService() {
         if (split && !splitActive && day != null) store.event("分屏或画中画，暂停计时")
         splitActive = split
         val foreground = if (split || !unlockedScreen) null else
-            (primary?.root ?: rootInActiveWindow)?.packageName?.toString()?.takeUnless { it == packageName }
+            (primary?.root ?: rootInActiveWindow)?.packageName?.toString()
         if (foreground != lastPackage && lastPackage != null && day?.packages("study")?.contains(lastPackage) == true) {
             store.event("离开学习应用")
         }
@@ -133,10 +135,21 @@ class StudyMonitor : AccessibilityService() {
             focusSeconds = 0
         }
         val study = usageGranted && foreground != null && day?.packages("study")?.contains(foreground) == true &&
-            !verificationPending && foreground !in protected
+            !verificationPending && foreground !in protected && !day.optBoolean("endedEarly") &&
+            store.remainingPass(day) == 0L
         val entertainment = foreground != null && day?.packages("entertainment")?.contains(foreground) == true &&
             foreground !in protected
-        val blocked = entertainment && day?.optString("status") == "active" && store.remainingPass(day) == 0L
+        val passEnd = day?.takeIf { store.remainingPass(it) > 0 }?.optLong("pauseUntil") ?: 0L
+        if (allowance != passEnd || (foreground != null && foreground != allowedApp) || split) allowedApp = null
+        allowance = passEnd
+        val blocked = if (entertainment && day?.isLearning() == true) {
+            if (passEnd == 0L) true
+            else if (allowedApp == foreground) false
+            else if (store.usePassOpening(day)) {
+                allowedApp = foreground
+                false
+            } else true
+        } else false
         val app = if (study || (entertainment && !blocked && usageGranted)) foreground else null
         val continued = app == segmentApp && key == segmentDay && study == segmentStudy
         if (segmentApp != null && oldWall > 0 && !clockJump && gap in 1..2_000) {
@@ -168,7 +181,7 @@ class StudyMonitor : AccessibilityService() {
         when {
             blocked && day?.optString("status") == "active" -> showBlock(day, foreground!!)
             verificationPending && foreground != null && day?.packages("study")?.contains(foreground) == true &&
-                usageGranted && foreground !in protected -> showVerification()
+                usageGranted && foreground !in protected && !day.optBoolean("endedEarly") && passEnd == 0L -> showVerification()
             else -> dismissOverlay()
         }
     }
@@ -184,13 +197,17 @@ class StudyMonitor : AccessibilityService() {
     }
 
     private fun showBlock(day: JSONObject, foreground: String) {
-        val key = "block/$foreground"
+        val key = "block/$foreground/${store.remainingPass(day) > 0}"
         if (overlayKey == key) return
         store.event("拦截娱乐应用：$foreground")
         val seconds = (day.getInt("minutes") * 60 - day.getInt("seconds")).coerceAtLeast(0)
         val totalUsage = day.optJSONObject("usage")?.let { usage -> usage.keys().asSequence().sumOf { usage.getInt(it) } } ?: 0
-        val passes = 2 - day.getInt("passes")
-        panel(key, "娱乐尚未解锁", "剩余学习 ${formatTime(seconds)} · 完成度 ${day.getInt("completion")}%\n今日娱乐 ${formatTime(totalUsage)}",
+        val limits = day.passLimits()
+        val passes = limits.daily - day.getInt("passes")
+        val secure = getSystemService(KeyguardManager::class.java).isDeviceSecure
+        val detail = if (!secure) "\n请先设置手机锁屏密码" else if (store.remainingPass(day) > 0)
+            "\n本次放行的打开次数已用完" else ""
+        panel(key, "娱乐尚未解锁", "剩余学习 ${formatTime(seconds)} · 完成度 ${day.getInt("completion")}%\n今日娱乐 ${formatTime(totalUsage)}$detail",
             "返回学习") {
             dismissOverlay()
             performGlobalAction(GLOBAL_ACTION_HOME)
@@ -198,12 +215,11 @@ class StudyMonitor : AccessibilityService() {
                 ?: Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             runCatching { startActivity(target) }
         }?.let { layout ->
-            if (passes > 0) layout.addView(button("紧急放行 5 分钟（剩 $passes 次）") {
-                layout.removeViewAt(layout.childCount - 1)
-                layout.addView(button("确认放行 5 分钟") {
-                    if (store.today() === day) store.pass(day)
-                    dismissOverlay()
-                })
+            if (secure && store.canPass(day)) layout.addView(button("放行 ${limits.minutes} 分钟（剩 $passes 次）") {
+                startActivity(StudyExitActivity.intent(this, end = false))
+            })
+            if (secure) layout.addView(button("结束今日学习") {
+                startActivity(StudyExitActivity.intent(this, end = true))
             })
         }
     }
