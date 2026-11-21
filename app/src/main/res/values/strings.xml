@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">StudyUnlock</string>
+    <string name="service_description">识别当前应用以记录学习时间，并为你选定的娱乐应用显示拦截页。记录保存在本机。</string>
 </resources>
