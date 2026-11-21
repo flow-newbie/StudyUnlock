@@ -4,6 +4,7 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
@@ -23,6 +24,8 @@ import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlin.math.*
@@ -34,25 +37,35 @@ internal val Paper = Color(0xfff2f3f9)
 internal val Line = Color(0xffdce0ee)
 
 @Composable
-internal fun CapsuleNav(selected: Int, select: (Int) -> Unit) {
-    val position by animateFloatAsState(selected.toFloat(), spring(0.63f, 460f), label = "navigation")
-    val stretch = (abs(position - selected) * 0.24f).coerceAtMost(.42f)
+internal fun CapsuleNav(selected: Int, openAi: () -> Unit, select: (Int) -> Unit) {
+    val centers = listOf(.15f, .70f, .89f)
+    val position by animateFloatAsState(centers[selected], spring(0.63f, 460f), label = "navigation")
+    val stretch = (abs(position - centers[selected]) * .55f).coerceAtMost(.36f)
     BoxWithConstraints(
         Modifier.padding(horizontal = 24.dp, vertical = 8.dp).fillMaxWidth().height(56.dp)
             .clip(CircleShape).background(Color(0xffe7eaf5)).border(1.dp, Color.White, CircleShape)
             .selectableGroup()
     ) {
-        val cell = maxWidth / 3
+        val navWidth = maxWidth
+        val cell = navWidth * .20f
         val width = cell * (.86f + stretch)
-        Box(Modifier.offset(x = cell * (position + .5f) - width / 2, y = 6.dp)
+        Box(Modifier.offset(x = maxWidth * position - width / 2, y = 6.dp)
             .size(width, 44.dp).background(Color.White.copy(alpha = .78f), CircleShape)
             .border(1.dp, Color.White, CircleShape))
-        Row(Modifier.fillMaxSize()) {
+        Box(Modifier.fillMaxSize()) {
             listOf("今日", "记录", "设置").forEachIndexed { index, label ->
-                Box(Modifier.weight(1f).fillMaxHeight()
+                Box(Modifier.offset(x = navWidth * centers[index] - cell / 2).width(cell).fillMaxHeight()
                     .selectable(selected == index, role = Role.Tab) { select(index) }, Alignment.Center) {
                     Text(label, color = if (selected == index) Accent else Muted, fontWeight = FontWeight.SemiBold)
                 }
+            }
+            Box(Modifier.align(Alignment.Center).offset(x = -navWidth * .06f).size(50.dp)
+                .clip(CircleShape)
+                .background(Brush.linearGradient(listOf(Color(0xff7760c9), Color(0xff5851b4))))
+                .border(1.dp, Color.White.copy(alpha = .86f), CircleShape)
+                .clickable(role = Role.Button, onClick = openAi)
+                .semantics { contentDescription = "AI 查询" }, Alignment.Center) {
+                Text("AI", color = Color.White, fontWeight = FontWeight.Bold)
             }
         }
     }

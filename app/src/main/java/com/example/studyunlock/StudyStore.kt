@@ -18,6 +18,7 @@ internal class StudyStore private constructor(context: Context) {
     } else JSONObject().put("version", 1).put("balance", 0).put("days", JSONObject())
         .put("ledger", JSONArray()).put("events", JSONArray())
     val changes = MutableStateFlow(0)
+    val settlement = MutableStateFlow<Settlement?>(null)
     private val zone = ZoneId.of("Asia/Shanghai")
 
     fun date(time: Long = System.currentTimeMillis()): LocalDate =
@@ -32,6 +33,29 @@ internal class StudyStore private constructor(context: Context) {
     fun ledger() = data.getJSONArray("ledger")
     fun events() = data.getJSONArray("events")
     fun export() = data.toString(2)
+
+    fun startTask(minutes: Int) {
+        require(minutes in 1..1440)
+        val key = date().toString()
+        val templates = data.optJSONArray("templates") ?: return
+        val template = (templates.length() - 1 downTo 0).asSequence().map(templates::getJSONObject)
+            .firstOrNull { it.getString("effective") <= key } ?: return
+        val prior = today()
+        if (prior?.isLearning() == true) return
+        val history = prior?.optJSONArray("tasks") ?: JSONArray()
+        if (prior != null) {
+            val entry = JSONObject(prior.toString())
+            entry.remove("tasks")
+            history.put(entry)
+        }
+        val task = JSONObject(template.toString()).put("minutes", minutes)
+            .put("taskId", java.util.UUID.randomUUID().toString())
+            .put("seconds", 0).put("completion", 0).put("status", "active")
+            .put("passes", prior?.optInt("passes") ?: 0).put("pauseUntil", 0)
+            .put("tasks", history)
+        days().put(key, task)
+        commit()
+    }
 
     private fun commit() {
         val stream = file.startWrite()
@@ -68,21 +92,6 @@ internal class StudyStore private constructor(context: Context) {
         commit()
     }
 
-    fun openDay(key: LocalDate = date()): JSONObject? {
-        val days = days()
-        days.optJSONObject(key.toString())?.let { return it }
-        val versions = data.optJSONArray("templates") ?: return null
-        val template = (versions.length() - 1 downTo 0).map { versions.getJSONObject(it) }
-            .firstOrNull { it.getString("effective") <= key.toString() } ?: return null
-        if (days.keys().asSequence().any { it > key.toString() }) return null
-        val day = JSONObject(template.toString()).put("seconds", 0).put("completion", 0)
-            .put("status", "active").put("passes", 0).put("pauseUntil", 0)
-            .put("practice", key.toString() < data.getString("starts"))
-        days.put(key.toString(), day)
-        commit()
-        return day
-    }
-
     fun settle(now: LocalDate = date()) {
         var changed = false
         for (key in days().keys().asSequence().sorted().toList()) {
@@ -92,10 +101,7 @@ internal class StudyStore private constructor(context: Context) {
                 day.optBoolean("practice") -> day.put("status", "practice")
                 day.optBoolean("incomplete") -> day.put("status", "incomplete")
                 else -> {
-                    val penalty = day.getInt("penalty")
-                    val deducted = minOf(penalty, balance())
-                    points(-deducted, if (deducted < penalty) "未足额扣除（目标扣 $penalty）" else "未完成", key)
-                    day.put("status", "failed")
+                    failTask(day, key)
                 }
             }
             changed = true
@@ -131,12 +137,14 @@ internal class StudyStore private constructor(context: Context) {
         val day = today() ?: return
         if (!day.isLearning()) return
         day.put("completion", value.coerceIn(0, 100)).put("completionAt", System.currentTimeMillis())
-        unlock(day, date(), ready)
+        val completed = unlock(day, date(), ready)
         commit()
+        if (completed) settlement.value = Settlement(true)
     }
 
-    fun record(key: LocalDate, app: String, seconds: Int, study: Boolean, ready: Boolean, endedAt: Long) {
+    fun record(key: LocalDate, taskId: String, app: String, seconds: Int, study: Boolean, ready: Boolean, endedAt: Long) {
         val day = days().optJSONObject(key.toString()) ?: return
+        if (day.taskId() != taskId || (study && !day.isLearning())) return
         val field = if (study) "studyUsage" else "usage"
         val usage = day.optJSONObject(field) ?: JSONObject().also { day.put(field, it) }
         usage.put(app, usage.optInt(app) + seconds)
@@ -150,30 +158,33 @@ internal class StudyStore private constructor(context: Context) {
             sessions.put(JSONObject().put("app", app).put("study", study).put("start", start)
                 .put("end", endedAt).put("seconds", seconds))
         }
-        if (study) {
+        val completed = if (study) {
             day.put("seconds", day.getInt("seconds") + seconds)
             unlock(day, key, ready)
-        }
+        } else false
         commit()
+        if (completed && key == date()) settlement.value = Settlement(true)
     }
 
-    private fun unlock(day: JSONObject, key: LocalDate, ready: Boolean) {
+    private fun unlock(day: JSONObject, key: LocalDate, ready: Boolean): Boolean {
         if (!ready || !day.isLearning() || day.getInt("seconds") < day.getInt("minutes") * 60 ||
-            day.getInt("completion") != 100) return
+            day.getInt("completion") != 100) return false
         day.put("status", "unlocked").put("unlockedAt", System.currentTimeMillis())
         if (!day.optBoolean("practice")) {
             val reward = day.getInt("reward")
             val credited = minOf(reward, 1000 - balance())
             points(credited, if (credited < reward) "学习达标（积分封顶）" else "学习达标", key.toString())
         }
+        return true
     }
 
     fun recheck() {
         val day = today() ?: return
         if (day.isLearning() && day.getInt("completion") == 100 &&
             day.getInt("seconds") >= day.getInt("minutes") * 60) {
-            unlock(day, date(), true)
+            val completed = unlock(day, date(), true)
             commit()
+            if (completed) settlement.value = Settlement(true)
         }
     }
 
@@ -201,8 +212,17 @@ internal class StudyStore private constructor(context: Context) {
     fun endLearning(day: JSONObject) {
         if (today() !== day || !day.isLearning()) return
         day.put("endedEarly", true).put("pauseUntil", 0).put("pauseBoot", 0)
+        failTask(day, date().toString())
         appendEvent("主动结束学习")
         commit()
+        settlement.value = Settlement(false)
+    }
+
+    private fun failTask(day: JSONObject, date: String) {
+        val penalty = day.getInt("penalty")
+        val deducted = minOf(penalty, balance())
+        points(-deducted, if (deducted < penalty) "未足额扣除（目标扣 $penalty）" else "未完成", date)
+        day.put("status", "failed")
     }
 
     fun remainingPass(day: JSONObject): Long {
@@ -262,7 +282,7 @@ internal class StudyStore private constructor(context: Context) {
             val day = incomingDays.getJSONObject(key)
             checkTemplate(day)
             require(day.getInt("seconds") >= 0 && day.getInt("completion") in 0..100 &&
-                day.getInt("passes") in 0..day.passLimits().daily && day.optInt("opensUsed") in 0..day.passLimits().opens)
+                day.getInt("passes") in 0..20 && day.optInt("opensUsed") in 0..day.passLimits().opens)
             require(day.getString("status") in setOf("active", "unlocked", "failed", "incomplete", "practice"))
             for (field in listOf("usage", "studyUsage")) {
                 day.optJSONObject(field)?.let { usage ->
@@ -299,6 +319,8 @@ internal data class PassLimits(val minutes: Int = 5, val daily: Int = 2, val ope
 
 internal fun JSONObject.passLimits() = PassLimits(optInt("passMinutes", 5), optInt("dailyPasses", 2), optInt("passOpens", 2))
 internal fun JSONObject.isLearning() = optString("status") == "active" && !optBoolean("endedEarly")
+internal fun JSONObject.taskId(): String = optString("taskId", "legacy")
+internal class Settlement(val success: Boolean)
 
 internal fun JSONObject.packages(key: String): Set<String> {
     val array = getJSONArray(key)

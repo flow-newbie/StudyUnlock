@@ -54,6 +54,7 @@ class StudyMonitor : AccessibilityService() {
     private var lastPackage: String? = null
     private val protected by lazy { protectedApps(this) }
     private var segmentDay: LocalDate? = null
+    private var segmentTask = ""
     private var segmentApp: String? = null
     private var segmentStudy = false
     private var segmentMs = 0L
@@ -63,6 +64,7 @@ class StudyMonitor : AccessibilityService() {
     private var verificationSince = 0L
     private var verificationFailed = false
     private var verificationDay: LocalDate? = null
+    private var verificationTask = ""
     private var splitActive = false
     private var allowedApp: String? = null
     private var allowance = 0L
@@ -99,7 +101,8 @@ class StudyMonitor : AccessibilityService() {
         previousWall = now
         previousElapsed = elapsed
         val key = store.date(now)
-        val day = store.openDay(key)
+        val day = store.today()
+        val task = day?.taskId().orEmpty()
         if (clockJump) {
             store.event("系统时间变更")
             store.incomplete("日期记录不完整", store.date(oldWall))
@@ -129,13 +132,15 @@ class StudyMonitor : AccessibilityService() {
             store.event("离开学习应用")
         }
 
-        if (verificationDay != key) {
+        if (verificationDay != key || verificationTask != task) {
             verificationDay = key
+            verificationTask = task
             verificationPending = false
             focusSeconds = 0
+            nextCheck = Random.nextInt(20, 41) * 60
         }
         val study = usageGranted && foreground != null && day?.packages("study")?.contains(foreground) == true &&
-            !verificationPending && foreground !in protected && !day.optBoolean("endedEarly") &&
+            !verificationPending && foreground !in protected && day.isLearning() &&
             store.remainingPass(day) == 0L
         val entertainment = foreground != null && day?.packages("entertainment")?.contains(foreground) == true &&
             foreground !in protected
@@ -151,7 +156,7 @@ class StudyMonitor : AccessibilityService() {
             } else true
         } else false
         val app = if (study || (entertainment && !blocked && usageGranted)) foreground else null
-        val continued = app == segmentApp && key == segmentDay && study == segmentStudy
+        val continued = app == segmentApp && key == segmentDay && task == segmentTask && study == segmentStudy
         if (segmentApp != null && oldWall > 0 && !clockJump && gap in 1..2_000) {
             val end = segmentDay?.let { store.endOfDay(it) } ?: now
             segmentMs += (minOf(now, end) - oldWall).coerceIn(0, gap)
@@ -163,6 +168,7 @@ class StudyMonitor : AccessibilityService() {
         if (!continued || clockJump) segmentMs = 0
         if (day != null) store.closePass(day)
         segmentDay = key
+        segmentTask = task
         segmentApp = app
         segmentStudy = study
         lastPackage = foreground
@@ -181,7 +187,7 @@ class StudyMonitor : AccessibilityService() {
         when {
             blocked && day?.optString("status") == "active" -> showBlock(day, foreground!!)
             verificationPending && foreground != null && day?.packages("study")?.contains(foreground) == true &&
-                usageGranted && foreground !in protected && !day.optBoolean("endedEarly") && passEnd == 0L -> showVerification()
+                usageGranted && foreground !in protected && day.isLearning() && passEnd == 0L -> showVerification()
             else -> dismissOverlay()
         }
     }
@@ -192,7 +198,7 @@ class StudyMonitor : AccessibilityService() {
         val seconds = (segmentMs / 1_000).toInt()
         if (seconds == 0) return
         segmentMs %= 1000
-        store.record(day, app, seconds, segmentStudy, usageGranted, minOf(previousWall, store.endOfDay(day)))
+        store.record(day, segmentTask, app, seconds, segmentStudy, usageGranted, minOf(previousWall, store.endOfDay(day)))
         if (segmentStudy) focusSeconds += seconds
     }
 
@@ -218,7 +224,7 @@ class StudyMonitor : AccessibilityService() {
             if (secure && store.canPass(day)) layout.addView(button("放行 ${limits.minutes} 分钟（剩 $passes 次）") {
                 startActivity(StudyExitActivity.intent(this, end = false))
             })
-            if (secure) layout.addView(button("结束今日学习") {
+            if (secure) layout.addView(button("结束本次学习") {
                 startActivity(StudyExitActivity.intent(this, end = true))
             })
         }
